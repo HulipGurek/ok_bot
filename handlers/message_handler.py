@@ -1,3 +1,6 @@
+"""
+Модуль для обработки команд и сообщений пользователя.
+"""
 import os
 import logging
 import pandas as pd
@@ -15,8 +18,6 @@ from utils.search import CarSearchEngine
 from utils.user_manager import UserManager
 from utils.synonyms import SynonymManager
 from utils.logging_utils import log_user_action
-
-from utils.text_utils import translit_ru_to_en  # <--- ВОТ ЭТО ДОБАВЬ
 
 logger = logging.getLogger(__name__)
 MODELS_PER_PAGE = 50
@@ -39,7 +40,7 @@ class MessageHandler:
         self.search_engine = CarSearchEngine(database.cars_df)
 
     async def show_models_with_pagination(self, update, context, matches, brand_query, page=0, edit=False):
-        matches = matches.sort_values(by=["model"], ascending=True, kind="stable")
+        matches = matches.sort_values(by=["model", "years"], ascending=[True, True])
         total = len(matches)
         start = page * MODELS_PER_PAGE
         end = start + MODELS_PER_PAGE
@@ -85,42 +86,35 @@ class MessageHandler:
         log_user_action(user.id, user.username, "BRAND_SEARCH", brand_query)
         await update.message.chat.send_action("typing")
         brand_query_norm = brand_query.strip().lower()
-        synonyms = self.synonym_manager.get_synonyms()
 
-        # 1. Применяем синонимы для brand и model (универсально)
-        canon = synonyms.get(brand_query_norm, brand_query_norm)
+        # 1. Точное совпадение
+        matches = self.db.cars_df[self.db.cars_df['brand'].str.lower() == brand_query_norm]
+        canonical_for_pagination = brand_query  # по умолчанию
 
-        # 2. Поиск по brand_lower
-        matches = self.db.cars_df[self.db.cars_df['brand_lower'] == canon]
-        canonical_for_pagination = canon
-
-        # 3. Если не найдено — ищем по model_lower
+        # 2. Частичное совпадение
         if matches.empty:
-            matches = self.db.cars_df[self.db.cars_df['model_lower'] == canon]
-            canonical_for_pagination = canon
-
-        # 4. Если не найдено — транслитерируем и снова ищем с синонимами
+            matches = self.db.cars_df[self.db.cars_df['brand'].str.lower().str.contains(brand_query_norm)]
+        # 3. Поиск по синонимам
         if matches.empty:
-            from utils.text_utils import translit_ru_to_en
-            translit = translit_ru_to_en(brand_query_norm)
-            canon_trans = synonyms.get(translit, translit)
-            matches = self.db.cars_df[self.db.cars_df['brand_lower'] == canon_trans]
-            canonical_for_pagination = canon_trans
-            if matches.empty:
-                matches = self.db.cars_df[self.db.cars_df['model_lower'] == canon_trans]
-                canonical_for_pagination = canon_trans
+            synonyms = self.synonym_manager.get_synonyms()
+            for canon, syns in synonyms.items():
+                all_syns = [canon] + (syns if isinstance(syns, list) else [syns])
+                if brand_query_norm in [s.lower() for s in all_syns]:
+                    matches = self.db.cars_df[self.db.cars_df['brand'].str.lower() == canon.lower()]
+                    canonical_for_pagination = canon
+                    break
 
-        # 5. Если всё ещё пусто — ничего не найдено
+        # 4. Если ничего не найдено — ошибка
         if matches.empty:
             await update.message.reply_text(
-                f'По запросу <b>"{brand_query}"</b> не найдено ни одной модели.',
-                parse_mode='HTML',
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Новый поиск", callback_data="new_search")]])
+                f"По запросу <b>\"{brand_query}\"</b> не найдено ни одной марки автомобиля.",
+                parse_mode='HTML'
             )
             return
 
+        # 5. Всегда используем show_models_with_pagination!
         await self.show_models_with_pagination(update, context, matches, canonical_for_pagination, page=0)
-  
+
     def _create_model_buttons_multirow(self, matches: pd.DataFrame, buttons_per_row: int = 1) -> List[List[InlineKeyboardButton]]:
         """
         Создает кнопки для выбора модели автомобиля с несколькими кнопками в строке.
@@ -133,7 +127,7 @@ class MessageHandler:
             List[List[InlineKeyboardButton]]: Список кнопок
 
         """
-        matches = matches.sort_values(by=["model"], ascending=True, kind="stable")
+        matches = matches.sort_values(by=["model", "years"], ascending=[True, True])
         buttons = []
         current_row = []
         seen = set()
@@ -179,33 +173,50 @@ class MessageHandler:
             await self.handle_brand_search(update, context, update.message.text)
             return
             
+        # Оригинальный код обработки сообщения
         user = update.effective_user
         self.user_manager.register_user(user.id)
         text = update.message.text.strip()
         context.user_data['user_query_message_id'] = update.message.message_id
-
+        
+        # Логирование действия пользователя
         log_user_action(user.id, user.username, "SEARCH", text)
+        
+        # Отправка индикатора загрузки
         await update.message.chat.send_action("typing")
+        
+        # Получение синонимов
         synonyms = self.synonym_manager.get_synonyms()
-
+        
+        # Функция для логирования отладочной информации
         def log_debug(msg: str) -> None:
             logger.info(f"SEARCH_DEBUG | User: {user.id} | Query: {text!r} | {msg}")
-
+        
+        # Проверяем, является ли запрос просто маркой автомобиля (без модели)
+        # Это эвристика: если запрос короткий (1-2 слова) и не содержит цифр, 
+        # то это, вероятно, только марка
         words = text.split()
         contains_digits = any(char.isdigit() for char in text)
-
+        
         if len(words) <= 2 and not contains_digits:
-            await self.handle_brand_search(update, context, text)
-            return
-
-
+            # Проверяем, есть ли точное совпадение по марке
+            brand_matches = self.db.cars_df[self.db.cars_df['brand'].str.lower() == text.lower()]
+            
+            # Если есть точное совпадение по марке, обрабатываем как поиск по марке
+            if not brand_matches.empty:
+                await self.handle_brand_search(update, context, text)
+                return
+        
+        # Поиск автомобилей по обычному запросу
         result = self.search_engine.search(text, synonyms, log_debug=log_debug)
         matches = result['matches']
         similar = result['similar']
-
+        
+        # Если нет совпадений, но есть похожие результаты
         if matches.empty and not similar.empty:
             buttons = self._create_model_buttons(similar)
             buttons.append([InlineKeyboardButton("🔄 Новый поиск", callback_data="new_search")])
+            
             await update.message.reply_text(
                 f"🔍 По запросу <b>\"{text}\"</b> точных совпадений не найдено, но есть похожие модели:\n\n"
                 f"Выберите модель из списка:",
@@ -213,7 +224,8 @@ class MessageHandler:
                 parse_mode='HTML'
             )
             return
-
+        
+        # Если нет совпадений и нет похожих результатов
         if matches.empty:
             await update.message.reply_text(
                 f"По запросу <b>\"{text}\"</b> ничего не найдено.\n\n"
@@ -223,22 +235,27 @@ class MessageHandler:
                 parse_mode='HTML'
             )
             return
-
+        
+        # Если найдено только одно совпадение
         if len(matches) == 1:
             car = matches.iloc[0]
             car_info = self.db.get_car_info(car)
+            
             mount = car['mount']
             driver_size = int(car['driver']) if str(car['driver']).isdigit() else None
             pass_size = int(car['passanger']) if str(car['passanger']).isdigit() else None
+            
+            # Получение доступных типов корпусов
             available_frames = self.db.get_available_frames(mount, [driver_size, pass_size])
-
+            
             if available_frames.empty:
                 await update.message.reply_text(
                     car_info + "\n⚠️ К сожалению, для этого автомобиля нет подходящих щёток в нашем каталоге.",
                     parse_mode='HTML'
                 )
                 return
-
+            
+            # Создание кнопок для выбора типа корпуса
             buttons = []
             for _, rowf in available_frames.iterrows():
                 frame = rowf['gy_frame']
@@ -253,23 +270,23 @@ class MessageHandler:
                 })
                 btn = InlineKeyboardButton(str(frame), callback_data=f"frame_{frame_id}")
                 buttons.append([btn])
+            
+
+            
+            # Добавление кнопки для нового поиска
             buttons.append([InlineKeyboardButton("🔄 Новый поиск", callback_data="new_search")])
+            
             await update.message.reply_text(
                 car_info + "\n<b>Выберите тип щётки:</b>",
                 reply_markup=InlineKeyboardMarkup(buttons),
                 parse_mode='HTML'
             )
             return
-
-        # --- ВАЖНО: вот тут патч! ---
-        # Если найдено много совпадений — используем пагинацию!
-        if len(matches) > MODELS_PER_PAGE:
-            await self.show_models_with_pagination(update, context, matches, text, page=0)
-            return
-
-        # Если совпадений мало — старое поведение
+        
+        # Если найдено несколько совпадений
         buttons = self._create_model_buttons(matches)
         buttons.append([InlineKeyboardButton("🔄 Новый поиск", callback_data="new_search")])
+        
         await update.message.reply_text(
             f"🔍 По запросу <b>\"{text}\"</b> найдено {len(matches)} моделей:\n\n"
             f"Выберите модель из списка:",
@@ -278,7 +295,7 @@ class MessageHandler:
         )
     
     def _create_model_buttons(self, matches: pd.DataFrame) -> List[List[InlineKeyboardButton]]:
-        matches = matches.sort_values(by=["model"], ascending=True, kind="stable") 
+        matches = matches.sort_values(by=["model", "years"], ascending=[True, True]) 
         buttons = []
         seen = set()
         for _, row in matches.iterrows():
